@@ -13,11 +13,72 @@ import java.util.List;
 
 @Repository
 public interface MessageRepository extends JpaRepository<Message, Long> {
-    @Query("SELECT m FROM Message m WHERE m.type = 'people' AND ((m.sender = :u1 AND m.receiver = :u2) OR (m.sender = :u2 AND m.receiver = :u1)) ORDER BY m.createdAt DESC")
-    List<Message> findPeopleMessages(@Param("u1") String u1, @Param("u2") String u2, Pageable pageable);
 
-    @Query("SELECT m FROM Message m WHERE m.type = 'room' AND m.receiver = :roomName ORDER BY m.createdAt DESC")
-    List<Message> findRoomMessages(@Param("roomName") String roomName, Pageable pageable);
+    @Query("""
+        SELECT m
+        FROM Message m
+        WHERE m.type = 'people'
+          AND (
+                (m.sender = :userA AND m.receiver = :userB)
+                OR
+                (m.sender = :userB AND m.receiver = :userA)
+              )
+        ORDER BY m.createdAt DESC
+        """)
+    List<Message> findPeopleMessages(
+            String userA,
+            String userB,
+            Pageable pageable
+    );
+
+    @Query("""
+        SELECT m
+        FROM Message m
+        WHERE m.type = 'room'
+          AND m.receiver = :roomName
+        ORDER BY m.createdAt DESC
+        """)
+    List<Message> findRoomMessages(
+            String roomName,
+            Pageable pageable
+    );
+
+    @Query("""
+        SELECT m
+        FROM Message m
+        WHERE m.type = 'people'
+          AND (
+                (m.sender = :userA AND m.receiver = :userB)
+                OR
+                (m.sender = :userB AND m.receiver = :userA)
+              )
+          AND m.createdAt >= :fromTime
+          AND m.createdAt < :toTime
+        ORDER BY m.createdAt DESC
+        """)
+    List<Message> findPeopleMessagesBetween(
+            String userA,
+            String userB,
+            java.time.LocalDateTime fromTime,
+            java.time.LocalDateTime toTime,
+            Pageable pageable
+    );
+
+    @Query("""
+        SELECT m
+        FROM Message m
+        WHERE m.type = 'room'
+          AND m.receiver = :roomName
+          AND m.createdAt >= :fromTime
+          AND m.createdAt < :toTime
+        ORDER BY m.createdAt DESC
+        """)
+    List<Message> findRoomMessagesBetween(
+            String roomName,
+            java.time.LocalDateTime fromTime,
+            java.time.LocalDateTime toTime,
+            Pageable pageable
+    );
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Transactional
