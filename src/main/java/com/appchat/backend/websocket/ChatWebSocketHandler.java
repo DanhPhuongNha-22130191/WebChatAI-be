@@ -2,10 +2,7 @@ package com.appchat.backend.websocket;
 
 import com.appchat.backend.dto.ApiResponse;
 import com.appchat.backend.dto.SocketMessageDto;
-import com.appchat.backend.entity.Message;
-import com.appchat.backend.entity.Room;
-import com.appchat.backend.entity.RoomMember;
-import com.appchat.backend.entity.User;
+import com.appchat.backend.entity.*;
 import com.appchat.backend.repository.GroupThemeRepository;
 import com.appchat.backend.repository.MessageRepository;
 import com.appchat.backend.repository.PendingConversationRepository;
@@ -31,7 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
-
+import com.appchat.backend.repository.MessageReactionRepository;
 @Component
 @RequiredArgsConstructor
 public class ChatWebSocketHandler extends TextWebSocketHandler {
@@ -45,7 +42,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     private final GroupThemeRepository groupThemeRepository;
     private final JwtUtil jwtUtil;
     private final PasswordEncoder passwordEncoder;
-
+    private final MessageReactionRepository messageReactionRepository;
     private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
     private final Map<String, WebSocketSession> userSessions = new ConcurrentHashMap<>();
 
@@ -202,11 +199,298 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             case "LEAVE_ROOM":
                 handleLeaveRoom(session, data);
                 break;
+            case "SEND_CONTACT_REQUEST":
+            case "CREATE_PENDING_CONVERSATION":
+            case "ADD_CONTACT":
+                handleSendContactRequest(session, data);
+                break;
+
+            case "GET_CONTACT_REQUESTS":
+            case "GET_PENDING_CONVERSATIONS":
+                handleGetContactRequests(session);
+                break;
+
+            case "ACCEPT_CONTACT_REQUEST":
+            case "ACCEPT_PENDING_CONVERSATION":
+                handleAcceptContactRequest(session, data);
+                break;
+
+            case "DELETE_CONTACT_REQUEST":
+            case "REJECT_CONTACT_REQUEST":
+            case "DELETE_PENDING_CONVERSATION":
+                handleDeleteContactRequest(session, data);
+                break;
+            case "REACT_MESSAGE":
+                handleReactMessage(session, data);
+                break;
 
             default:
                 sendMessage(session, "error", event, "Event không được hỗ trợ", null);
                 break;
         }
+    }
+
+
+    private void handleReactMessage(
+            WebSocketSession session,
+            Map<String, Object> data
+    ) throws Exception {
+
+        String username = getUsernameFromSession(session);
+        Long messageId = readLong(data, "messageId", "id");
+        String reaction = readString(data, "reaction", "emoji");
+
+        if ("REMOVE".equalsIgnoreCase(reaction)) {
+            reaction = null;
+        }
+
+        if (username == null) {
+            sendMessage(session, "error", "REACT_MESSAGE", "Bạn cần đăng nhập trước", null);
+            return;
+        }
+
+        if (messageId == null) {
+            sendMessage(session, "error", "REACT_MESSAGE", "Không xác định được tin nhắn", null);
+            return;
+        }
+
+        Optional<Message> messageOptional = messageRepository.findById(messageId);
+
+        if (messageOptional.isEmpty()) {
+            sendMessage(session, "error", "REACT_MESSAGE", "Tin nhắn không tồn tại", null);
+            return;
+        }
+
+        Message chatMessage = messageOptional.get();
+
+        if (!canAccessMessage(chatMessage, username)) {
+            sendMessage(session, "error", "REACT_MESSAGE", "Bạn không có quyền thả cảm xúc tin nhắn này", null);
+            return;
+        }
+
+        if (reaction == null || reaction.isBlank() || "REMOVE".equalsIgnoreCase(reaction)) {
+            messageReactionRepository
+                    .findByMessageIdAndUsername(messageId, username)
+                    .ifPresent(messageReactionRepository::delete);
+        } else {
+            MessageReaction messageReaction = messageReactionRepository
+                    .findByMessageIdAndUsername(messageId, username)
+                    .orElseGet(() -> MessageReaction.builder()
+                            .messageId(messageId)
+                            .username(username)
+                            .build());
+
+            messageReaction.setReaction(reaction);
+            messageReactionRepository.save(messageReaction);
+        }
+
+        Map<String, Object> payload = toClientMessage(chatMessage);
+
+        sendMessageToParticipantsExceptRequester(
+                chatMessage,
+                username,
+                "REACT_MESSAGE",
+                "Đã cập nhật cảm xúc tin nhắn",
+                payload
+        );
+
+        sendMessage(
+                session,
+                "success",
+                "REACT_MESSAGE",
+                "Đã cập nhật cảm xúc tin nhắn",
+                payload
+        );
+    }
+
+    private void handleSendContactRequest(
+            WebSocketSession session,
+            Map<String, Object> data
+    ) throws Exception {
+
+        String from = getUsernameFromSession(session);
+        String to = readString(data, "to", "user", "username", "name", "receiver");
+
+        if (from == null) {
+            sendMessage(session, "error", "SEND_CONTACT_REQUEST", "Bạn cần đăng nhập trước", null);
+            return;
+        }
+
+        if (to == null) {
+            sendMessage(session, "error", "SEND_CONTACT_REQUEST", "Username cần liên hệ không hợp lệ", null);
+            return;
+        }
+
+        if (from.equals(to)) {
+            sendMessage(session, "error", "SEND_CONTACT_REQUEST", "Bạn không thể tự gửi lời mời cho chính mình", null);
+            return;
+        }
+
+        if (userRepository.findByUsername(to).isEmpty()) {
+            sendMessage(session, "error", "SEND_CONTACT_REQUEST", "Người dùng không tồn tại", null);
+            return;
+        }
+
+        PendingConversation pc = pendingConversationRepository.findBetweenUsers(from, to)
+                .map(existing -> {
+                    if (!"ACCEPTED".equals(existing.getStatus())) {
+                        existing.setFromUsername(from);
+                        existing.setToUsername(to);
+                        existing.setStatus("PENDING");
+                    }
+
+                    return pendingConversationRepository.save(existing);
+                })
+                .orElseGet(() -> pendingConversationRepository.save(
+                        PendingConversation.builder()
+                                .fromUsername(from)
+                                .toUsername(to)
+                                .status("PENDING")
+                                .build()
+                ));
+
+        Map<String, Object> payload = toClientPendingConversation(pc);
+
+        if ("ACCEPTED".equals(pc.getStatus())) {
+            sendMessage(session, "success", "SEND_CONTACT_REQUEST", "Hai người đã có trong danh sách liên hệ", payload);
+            return;
+        }
+
+        sendMessage(session, "success", "SEND_CONTACT_REQUEST", "Đã gửi lời mời liên hệ", payload);
+        sendRealtimeToUser(to, "CONTACT_REQUEST_RECEIVED", "Bạn có lời mời liên hệ mới", payload);
+    }
+
+    private void handleGetContactRequests(WebSocketSession session) throws Exception {
+        String username = getUsernameFromSession(session);
+
+        if (username == null) {
+            sendMessage(session, "error", "GET_CONTACT_REQUESTS", "Bạn cần đăng nhập trước", null);
+            return;
+        }
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+
+        payload.put("incoming", pendingConversationRepository
+                .findByToUsernameAndStatus(username, "PENDING")
+                .stream()
+                .map(this::toClientPendingConversation)
+                .toList());
+
+        payload.put("outgoing", pendingConversationRepository
+                .findByFromUsernameAndStatus(username, "PENDING")
+                .stream()
+                .map(this::toClientPendingConversation)
+                .toList());
+
+        payload.put("accepted", pendingConversationRepository
+                .findAcceptedConversations(username)
+                .stream()
+                .map(this::toClientPendingConversation)
+                .toList());
+
+        sendMessage(session, "success", "GET_CONTACT_REQUESTS", "Danh sách lời mời liên hệ", payload);
+    }
+
+    private void handleAcceptContactRequest(
+            WebSocketSession session,
+            Map<String, Object> data
+    ) throws Exception {
+
+        String currentUser = getUsernameFromSession(session);
+        String from = readString(data, "from", "fromUsername", "user", "username", "name");
+
+        if (currentUser == null) {
+            sendMessage(session, "error", "ACCEPT_CONTACT_REQUEST", "Bạn cần đăng nhập trước", null);
+            return;
+        }
+
+        if (from == null) {
+            sendMessage(session, "error", "ACCEPT_CONTACT_REQUEST", "Người gửi lời mời không hợp lệ", null);
+            return;
+        }
+
+        Optional<PendingConversation> pending =
+                pendingConversationRepository.findByFromUsernameAndToUsername(from, currentUser);
+
+        if (pending.isEmpty() || !"PENDING".equals(pending.get().getStatus())) {
+            sendMessage(session, "error", "ACCEPT_CONTACT_REQUEST", "Không tìm thấy lời mời đang chờ", null);
+            return;
+        }
+
+        PendingConversation pc = pending.get();
+        pc.setStatus("ACCEPTED");
+        pc = pendingConversationRepository.save(pc);
+
+        Map<String, Object> payload = toClientPendingConversation(pc);
+
+        sendMessage(session, "success", "ACCEPT_CONTACT_REQUEST", "Đã chấp nhận lời mời liên hệ", payload);
+        sendRealtimeToUser(from, "CONTACT_REQUEST_ACCEPTED", currentUser + " đã chấp nhận lời mời liên hệ", payload);
+
+        handleGetUserList(session);
+
+        WebSocketSession fromSession = userSessions.get(from);
+        if (fromSession != null && fromSession.isOpen()) {
+            handleGetUserList(fromSession);
+        }
+    }
+
+    private void handleDeleteContactRequest(
+            WebSocketSession session,
+            Map<String, Object> data
+    ) throws Exception {
+
+        String currentUser = getUsernameFromSession(session);
+        String otherUser = readString(data, "user", "username", "name", "from", "fromUsername", "to", "toUsername");
+
+        if (currentUser == null) {
+            sendMessage(session, "error", "DELETE_CONTACT_REQUEST", "Bạn cần đăng nhập trước", null);
+            return;
+        }
+
+        if (otherUser == null) {
+            sendMessage(session, "error", "DELETE_CONTACT_REQUEST", "Username không hợp lệ", null);
+            return;
+        }
+
+        Optional<PendingConversation> pending =
+                pendingConversationRepository.findBetweenUsers(currentUser, otherUser);
+
+        if (pending.isEmpty()) {
+            sendMessage(session, "error", "DELETE_CONTACT_REQUEST", "Không tìm thấy lời mời liên hệ", null);
+            return;
+        }
+
+        PendingConversation pc = pending.get();
+
+        if (
+                !currentUser.equals(pc.getFromUsername()) &&
+                        !currentUser.equals(pc.getToUsername())
+        ) {
+            sendMessage(session, "error", "DELETE_CONTACT_REQUEST", "Bạn không có quyền xóa lời mời này", null);
+            return;
+        }
+
+        Map<String, Object> payload = toClientPendingConversation(pc);
+
+        pendingConversationRepository.delete(pc);
+
+        sendMessage(session, "success", "DELETE_CONTACT_REQUEST", "Đã xóa lời mời liên hệ", payload);
+        sendRealtimeToUser(otherUser, "CONTACT_REQUEST_DELETED", "Lời mời liên hệ đã bị xóa", payload);
+    }
+
+    private Map<String, Object> toClientPendingConversation(PendingConversation pc) {
+        Map<String, Object> data = new LinkedHashMap<>();
+
+        data.put("id", pc.getId());
+        data.put("from", pc.getFromUsername());
+        data.put("fromUsername", pc.getFromUsername());
+        data.put("to", pc.getToUsername());
+        data.put("toUsername", pc.getToUsername());
+        data.put("status", pc.getStatus());
+        data.put("createdAt", pc.getCreatedAt() == null ? null : pc.getCreatedAt().toString());
+        data.put("updatedAt", pc.getUpdatedAt() == null ? null : pc.getUpdatedAt().toString());
+
+        return data;
     }
 
     private boolean isPublicEvent(String event) {
@@ -1589,7 +1873,18 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         dto.put("status", recalled ? "recalled" : normalizeMessageStatus(message.getStatus()));
         dto.put("deliveredAt", message.getDeliveredAt() != null ? message.getDeliveredAt().toString() : null);
         dto.put("readAt", message.getReadAt() != null ? message.getReadAt().toString() : null);
+        List<Map<String, Object>> reactions = messageReactionRepository
+                .findByMessageId(message.getId())
+                .stream()
+                .map(reaction -> {
+                    Map<String, Object> item = new LinkedHashMap<>();
+                    item.put("username", reaction.getUsername());
+                    item.put("reaction", reaction.getReaction());
+                    return item;
+                })
+                .toList();
 
+        dto.put("reactions", reactions);
         return dto;
     }
 
