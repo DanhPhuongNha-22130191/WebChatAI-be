@@ -26,7 +26,7 @@ public class ChatSummaryController {
             @RequestParam String target,
             @RequestParam(defaultValue = "latest") String period,
             @RequestParam(defaultValue = "general") String mode,
-            @RequestParam(defaultValue = "100") int limit,
+            @RequestParam(defaultValue = "50") int limit,
             @RequestParam(required = false) String from,
             @RequestParam(required = false) String to,
             @RequestParam(defaultValue = "false") boolean force
